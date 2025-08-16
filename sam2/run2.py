@@ -1,25 +1,35 @@
 import matplotlib.pyplot as plt
-import numpy as np
 from PIL import Image
-import cv2
 import torch
 import numpy as np
 from transformers import AutoImageProcessor, AutoModel
-from PIL import Image
-import requests
 import faiss
-import torch
 from sam2.build_sam import build_sam2_video_predictor
 import h5py
-from dataset_sam2 import create_retrieval_dataset
+from dataset_sam2 import create_dataset_paths, create_validation_paths
+import os
 
 
-def load_medical_img(path_list):
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# Color scheme for medical segmentation (common classes)
+MEDICAL_COLORS = [
+    [0, 0, 0],          # Background (black)
+    [255, 0, 0],        # Class 1: e.g., Left Ventricle (red)
+    [0, 255, 0],        # Class 2: e.g., Myocardium (green)  
+    [0, 0, 255],        # Class 3: e.g., Right Ventricle (blue)
+]
+
+
+def load_medical_imgs(path_list):
+    imgs, labels = [], []
     for path in path_list:
         h5f = h5py.File(path, "r")
         img = h5f["image"][:]
         label = h5f["label"][:]
-    return img, label
+        imgs.append(img)
+        labels.append(label)
+    return imgs, labels
 
 
 def load_dino_model():
@@ -27,27 +37,39 @@ def load_dino_model():
     model = AutoModel.from_pretrained('facebook/dinov2-base')
     return processor, model
 
-def preprocess_img_for_sam2(image):
-    """Preprocess image specifically for SAM2 - returns numpy array"""
-    # Handle different input shapes
-    if len(image.shape) == 3 and image.shape[0] == 1:
-        image = image.squeeze(0)  # Remove batch dimension
-    if len(image.shape) == 3 and image.shape[2] == 1:
-        image = image.squeeze(-1)  # Remove channel dimension if single channel
-    
-    # Ensure 2D
-    if len(image.shape) > 2:
-        image = np.mean(image, axis=-1 if image.shape[-1] <= 3 else 0)
-    
-    # Normalize to [0, 1] for SAM2
-    image_min, image_max = image.min(), image.max()
-    if image_max > image_min:
-        image_normalized = (image - image_min) / (image_max - image_min)
+def preprocess_imgs_for_sam2(images):
+
+    def process(image):
+        """Preprocess image specifically for SAM2 - returns numpy array"""
+        # Handle different input shapes
+        if len(image.shape) == 3 and image.shape[0] == 1:
+            image = image.squeeze(0)  # Remove batch dimension
+        if len(image.shape) == 3 and image.shape[2] == 1:
+            image = image.squeeze(-1)  # Remove channel dimension if single channel
+        
+        # Ensure 2D
+        if len(image.shape) > 2:
+            image = np.mean(image, axis=-1 if image.shape[-1] <= 3 else 0)
+        
+        # Normalize to [0, 1] for SAM2
+        image_min, image_max = image.min(), image.max()
+        if image_max > image_min:
+            image_normalized = (image - image_min) / (image_max - image_min)
+        else:
+            image_normalized = np.zeros_like(image, dtype=np.float32)
+
+        image_normalized = image_normalized.astype(np.float32)
+        return image_normalized
+
+    proc_imgs = []
+    if not isinstance(images, list):
+        return process(images)
     else:
-        image_normalized = np.zeros_like(image, dtype=np.float32)
-    
-    print(f"SAM2 preprocessed image shape: {image_normalized.shape}, dtype: {image_normalized.dtype}")
-    return image_normalized.astype(np.float32)
+        for image in images:
+            image_normalized = process(image)
+            proc_imgs.append(image_normalized)
+
+        return proc_imgs
 
 
 def extract_class_masks_from_label(label, n_classes):
@@ -197,7 +219,66 @@ def create_multiclass_overlay(image, class_predictions, class_colors=None, alpha
     
     return overlayed.astype(np.uint8), legend_info
 
-def visualize_multiclass_results(image_test_sam, class_predictions, label_train=None, 
+
+def overlay_ref(mask, image, color_map=None, alpha=0.5):
+    def ensure_rgb(image):
+        """
+        Ensure image is in RGB format (3 channels)
+        
+        Args:
+            image: numpy array - can be grayscale (H, W) or RGB (H, W, 3)
+        
+        Returns:
+            rgb_image: numpy array of shape (H, W, 3)
+        """
+        if len(image.shape) == 2:
+            # Grayscale image - convert to RGB by stacking
+            return np.stack([image, image, image], axis=2)
+        elif len(image.shape) == 3 and image.shape[2] == 1:
+            # Single channel image with dimension
+            return np.repeat(image, 3, axis=2)
+        elif len(image.shape) == 3 and image.shape[2] == 3:
+            # Already RGB
+            return image
+        else:
+            raise ValueError(f"Unsupported image shape: {image.shape}")
+        
+
+    image = ensure_rgb(image)
+    
+    if color_map is None:
+        color_map = {
+            1: (255, 0, 0),    # Red
+            2: (0, 255, 0),    # Green
+            3: (0, 0, 255),    # Blue
+            4: (255, 255, 0),  # Yellow
+            5: (255, 0, 255),  # Magenta
+            6: (0, 255, 255),  # Cyan
+        }
+    
+    # Convert to float for calculations
+    image = image.astype(np.float32)
+    overlayed = image.copy()
+    
+    # Get unique mask values (excluding 0/background)
+    unique_values = np.unique(mask)
+    unique_values = unique_values[unique_values != 0]  # Remove background
+    
+    for mask_value in unique_values:
+        if mask_value in color_map:
+            # Create binary mask for this value
+            binary_mask = (mask == mask_value).astype(np.float32)
+            color = color_map[mask_value]
+            
+            # Apply colored overlay to each channel
+            for i in range(3):  # Now we're sure overlayed has 3 dimensions
+                overlayed[:, :, i] = (overlayed[:, :, i] * (1 - binary_mask * alpha) + 
+                                     color[i] * binary_mask * alpha)
+    
+    return np.clip(overlayed, 0, 255).astype(np.uint8)
+
+
+def visualize_multiclass_results(image_test_sam, class_predictions, lbl_ref, image_ref_sam, lbl_query,
                                 class_colors=None, save_prefix="multiclass_sam2"):
     """
     Comprehensive visualization for multi-class segmentation results
@@ -216,28 +297,44 @@ def visualize_multiclass_results(image_test_sam, class_predictions, label_train=
     overlayed_image, legend_info = create_multiclass_overlay(
         image_test_sam, class_predictions, class_colors
     )
+
+    # overlayed_image_ref = overlay_ref(
+    #     image_ref_sam, lbl_ref, class_colors
+    # )
     
     # Create visualization
-    if label_train is not None:
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    if lbl_ref is not None:
+        fig, axes = plt.subplots(2, 5, figsize=(15, 10))
         
         # Top row: Original, Ground Truth, Prediction
         axes[0, 0].imshow(image_test_sam, cmap='gray')
         axes[0, 0].set_title("Test Image")
         axes[0, 0].axis('off')
-        
-        axes[0, 1].imshow(label_train, cmap='tab10', vmin=0, vmax=n_classes)
-        axes[0, 1].set_title("Ground Truth")
+
+        axes[0, 1].imshow(pred_label, cmap='tab10', vmin=0, vmax=n_classes)
+        axes[0, 1].set_title("SAM2 Prediction")
         axes[0, 1].axis('off')
-        
-        axes[0, 2].imshow(pred_label, cmap='tab10', vmin=0, vmax=n_classes)
-        axes[0, 2].set_title("SAM2 Prediction")
+
+        axes[0, 2].imshow(lbl_query, cmap='tab10', vmin=0, vmax=n_classes)
+        axes[0, 2].set_title("Ground Truth")
         axes[0, 2].axis('off')
+        
+        axes[0, 3].imshow(image_ref_sam, cmap='gray')
+        axes[0, 3].set_title("Ref Image")
+        axes[0, 3].axis('off')
+        
+        axes[0, 4].imshow(lbl_ref, cmap='tab10', vmin=0, vmax=n_classes)
+        axes[0, 4].set_title("Ground Truth")
+        axes[0, 4].axis('off')
         
         # Bottom row: Individual class predictions and overlay
         axes[1, 0].imshow(overlayed_image)
         axes[1, 0].set_title("Multi-class Overlay")
         axes[1, 0].axis('off')
+
+        # axes[1, 0].imshow(overlayed_image_ref)
+        # axes[1, 0].set_title("Multi-class Overlay")
+        # axes[1, 0].axis('off')
         
         # Show individual class masks
         if n_classes >= 1:
@@ -325,36 +422,25 @@ def calculate_class_metrics(pred_label, true_label, n_classes):
     return metrics
 
 # Modified main function for your use case:
-def main_multiclass():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    
-    # Load models and data (your existing code)
-    processor, model = load_dino_model()
-    predictor = build_sam2_video_predictor(
-        "configs/sam2.1/sam2.1_hiera_t.yaml", 
-        "checkpoints/sam2.1_hiera_tiny.pt", 
-        device=device
-    )
-    
-    retrieval_paths = create_retrieval_dataset("../dataset/ACDC_2d_slices/Training")
+def main_multiclass(predictor, img_query, lbl_query, match_imgs_lbls):
 
-    image_train, label_train, image_test = load_medical_img()
-    
+    img_ref, lbl_ref = match_imgs_lbls[0]
     # Determine number of classes
-    unique_labels = np.unique(label_train)
+    unique_labels = np.unique(lbl_ref)
+    print(f"Unique labels in reference: {unique_labels}")
     n_classes = len(unique_labels) - 1 if 0 in unique_labels else len(unique_labels)
     print(f"Found {n_classes} classes: {unique_labels}")
     
     # Extract class masks
-    class_masks = extract_class_masks_from_label(label_train, n_classes)
+    class_masks = extract_class_masks_from_label(lbl_ref, n_classes)
+    print(f"Extracted {len(class_masks)} class masks from reference label")
     
     # Preprocess images for SAM2
-    image_train_sam = preprocess_img_for_sam2(image_train)
-    image_test_sam = preprocess_img_for_sam2(image_test)
+    image_ref_sam = preprocess_imgs_for_sam2(img_ref)
+    image_query_sam = preprocess_imgs_for_sam2(img_query)
     
     # Create array for SAM2
-    all_images = np.stack([image_train_sam, image_test_sam], axis=0)
+    all_images = np.stack([image_ref_sam, image_query_sam], axis=0)
     
     try:
         # Initialize SAM2
@@ -399,7 +485,7 @@ def main_multiclass():
             if len(class_preds) > 0:
                 background_pred = np.logical_not(np.logical_or.reduce(class_preds))
             else:
-                background_pred = np.ones_like(image_test_sam, dtype=bool)
+                background_pred = np.ones_like(image_query_sam, dtype=bool)
             
             class_preds.insert(0, background_pred)  # Add background as class 0
             
@@ -412,14 +498,14 @@ def main_multiclass():
             
             # Visualize results
             overlayed_image = visualize_multiclass_results(
-                image_test_sam, class_preds, label_train
+                image_query_sam, class_preds, lbl_ref, image_ref_sam, lbl_query
             )
             
             # Calculate metrics if ground truth available
-            if label_train is not None:
-                metrics = calculate_class_metrics(pred_label, label_train, n_classes)
+            if lbl_ref is not None:
+                metrics = calculate_class_metrics(pred_label, lbl_ref, n_classes)
             
-            return pred_label, overlayed_image, class_preds, metrics
+            return pred_label, overlayed_image, class_preds, metrics, image_query_sam
         
     except Exception as e:
         print(f"Error during multiclass SAM2 processing: {e}")
@@ -427,24 +513,106 @@ def main_multiclass():
         traceback.print_exc()
         return None, None, None, None
 
-# Color scheme for medical segmentation (common classes)
-MEDICAL_COLORS = [
-    [0, 0, 0],          # Background (black)
-    [255, 0, 0],        # Class 1: e.g., Left Ventricle (red)
-    [0, 255, 0],        # Class 2: e.g., Myocardium (green)  
-    [0, 0, 255],        # Class 3: e.g., Right Ventricle (blue)
-    [255, 255, 0],      # Class 4: (yellow)
-    [255, 0, 255],      # Class 5: (magenta)
-]
 
-# Usage in your script:
+def preprocess_imgs_for_dino(images):
+    """Preprocess image specifically for DINO"""
+    proc_imgs = []
+    for image in images:
+        # Handle different input shapes
+        if len(image.shape) == 3 and image.shape[0] == 1:
+            image = image.squeeze(0)  # Remove batch dimension
+        if len(image.shape) == 3 and image.shape[2] == 1:
+            image = image.squeeze(-1)  # Remove channel dimension if single channel
+        
+        # Ensure 2D
+        if len(image.shape) > 2:
+            image = np.mean(image, axis=-1 if image.shape[-1] <= 3 else 0)
+        
+        # Normalize to [0, 255]
+        image_min, image_max = image.min(), image.max()
+        if image_max > image_min:
+            image_normalized = ((image - image_min) / (image_max - image_min) * 255).astype(np.uint8)
+        else:
+            image_normalized = np.zeros_like(image, dtype=np.uint8)
+        
+        # Convert grayscale to RGB by repeating channels
+        image_rgb = np.stack([image_normalized] * 3, axis=-1)
+        
+        # Convert to PIL Image for processor compatibility
+        pil_image = Image.fromarray(image_rgb)
+        # print(f"DINO preprocessed image size: {pil_image.size}")
+        proc_imgs.append(pil_image)
+
+    return proc_imgs
+
+
+def get_dino_embeddings(images, processor, model):
+    proc_imgs = preprocess_imgs_for_dino(images)
+
+    embeddings = []
+    for image in proc_imgs:
+        inputs = processor(images=image, return_tensors="pt")
+        outputs = model(**inputs)
+        embedding = outputs.pooler_output.detach().cpu().numpy()
+        embeddings.append(embedding)
+
+    return embeddings
+
+
+def create_faiss_index(index, processor, model):
+    db_paths = create_dataset_paths("../dataset/ACDC_2d_slices/Training")
+    imgs_db, lbls_db = load_medical_imgs(db_paths)
+    imgs_embds = get_dino_embeddings(imgs_db, processor, model)
+    
+    for img_embd in imgs_embds:
+        index.add(img_embd)
+    
+    id_map = list(zip(imgs_db, lbls_db))
+    return index, id_map
+
+
+def get_query_imgs():
+    query_paths = create_validation_paths("../dataset/ACDC_2d_slices/Validation")
+    imgs_query, lbls_query = load_medical_imgs(query_paths)
+    print(f"Loaded {len(lbls_query)} query images")
+    imgs_embds = get_dino_embeddings(imgs_query, processor, model)
+    return imgs_query, imgs_embds, lbls_query
+
+
+def select_k_closest(index, id_map, img_embedding, k=5):
+    _, indices = index.search(img_embedding, k)
+    results = []
+    for pos, i in enumerate(indices[0]):
+        img, lbl = id_map[i]
+        results.append((img, lbl))
+
+    return results
+
 if __name__ == "__main__":
-    # Run multiclass segmentation
 
-    query_paths = create_retrieval_dataset("../dataset/ACDC_2d_slices/Validation")
-    image_train, label_train, image_test = load_medical_img(query_paths)
-    image_test_sam = preprocess_img_for_sam2(image_test)
-    pred_label, overlayed_image, class_predictions, metrics = main_multiclass()
+    print("heree")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    processor, model = load_dino_model()
+    predictor = build_sam2_video_predictor(
+        "configs/sam2.1/sam2.1_hiera_t.yaml", 
+        "checkpoints/sam2.1_hiera_tiny.pt", 
+        device=device
+    )
+
+    # Faiss index and vector store
+    index = faiss.IndexFlatIP(768)
+    index, id_map = create_faiss_index(index, processor, model)
+    print(f"111")
+    # Query embeddings
+    query_imgs, query_embds, lbls_query = get_query_imgs()
+    print(f"1111")
+    # Perform retrieval
+    match_imgs_lbls = select_k_closest(index, id_map, query_embds[0], k=1)
+    print(len(match_imgs_lbls))
+
+    # exit(0)  # Exit early for testing
+    pred_label, overlayed_image, class_predictions, metrics, img_query_sam = main_multiclass(predictor, query_imgs[0], lbls_query[0], match_imgs_lbls)
     
     if pred_label is not None:
         print("\n=== Segmentation Results ===")
@@ -453,13 +621,13 @@ if __name__ == "__main__":
         
         # You can also create custom overlays with specific colors
         custom_overlay, legend = create_multiclass_overlay(
-            image_test_sam, class_predictions, MEDICAL_COLORS, alpha=0.5
+            img_query_sam, class_predictions, MEDICAL_COLORS, alpha=0.5
         )
         
         # Display custom overlay
         plt.figure(figsize=(10, 5))
         plt.subplot(1, 2, 1)
-        plt.imshow(image_test_sam, cmap='gray')
+        plt.imshow(img_query_sam, cmap='gray')
         plt.title("Original Test Image")
         plt.axis('off')
         

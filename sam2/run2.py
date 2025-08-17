@@ -84,7 +84,7 @@ def extract_class_masks_from_label(label, n_classes):
         class_masks: list of boolean masks for each class
     """
     class_masks = []
-    for class_id in range(1, n_classes + 1):  # Start from 1, skip background (0)
+    for class_id in range(1, n_classes+1):  # Start from 1, skip background (0)
         class_mask = (label == class_id)
         class_masks.append(class_mask)
         print(f"Class {class_id} mask: {class_mask.sum()} pixels")
@@ -184,6 +184,7 @@ def create_multiclass_overlay(image, class_predictions, class_colors=None, alpha
             [128, 0, 255],    # Class 8 (purple)
         ]
     
+    labels = ["Background", "LV", "Myocardium", "RV"]
     # Ensure image is in RGB format
     if len(image.shape) == 2:
         image = np.stack([image] * 3, axis=-1)
@@ -215,7 +216,7 @@ def create_multiclass_overlay(image, class_predictions, class_colors=None, alpha
                                (1 - alpha) * overlayed + alpha * class_overlay, 
                                overlayed)
             
-            legend_info.append((f"Class {i}", color))
+            legend_info.append((f"{labels[i]}", color))
     
     return overlayed.astype(np.uint8), legend_info
 
@@ -295,12 +296,9 @@ def visualize_multiclass_results(image_test_sam, class_predictions, lbl_ref, ima
     
     # Create multiclass overlay
     overlayed_image, legend_info = create_multiclass_overlay(
-        image_test_sam, class_predictions, class_colors
+        image_test_sam, class_predictions, MEDICAL_COLORS
     )
 
-    # overlayed_image_ref = overlay_ref(
-    #     image_ref_sam, lbl_ref, class_colors
-    # )
     
     # Create visualization
     if lbl_ref is not None:
@@ -315,7 +313,7 @@ def visualize_multiclass_results(image_test_sam, class_predictions, lbl_ref, ima
         axes[0, 1].set_title("SAM2 Prediction")
         axes[0, 1].axis('off')
 
-        axes[0, 2].imshow(lbl_query, cmap='tab10', vmin=0, vmax=n_classes)
+        axes[0, 2].imshow(lbl_query, cmap='tab10', vmin=0, vmax=len(np.unique(lbl_query))-1)
         axes[0, 2].set_title("Ground Truth")
         axes[0, 2].axis('off')
         
@@ -346,7 +344,16 @@ def visualize_multiclass_results(image_test_sam, class_predictions, lbl_ref, ima
             axes[1, 2].imshow(class_predictions[2], cmap='gray')
             axes[1, 2].set_title("Class 2 Prediction")
             axes[1, 2].axis('off')
-        
+
+        if n_classes >= 3:
+            axes[1, 3].imshow(class_predictions[3], cmap='gray')
+            axes[1, 3].set_title("Class 3 Prediction")
+            axes[1, 3].axis('off')
+            axes[1, 4].axis('off')
+
+        else:
+            axes[1][3].axis('off')
+            axes[1][4].axis('off')
     else:
         fig, axes = plt.subplots(1, 3, figsize=(12, 4))
         
@@ -424,44 +431,47 @@ def calculate_class_metrics(pred_label, true_label, n_classes):
 # Modified main function for your use case:
 def main_multiclass(predictor, img_query, lbl_query, match_imgs_lbls):
 
-    img_ref, lbl_ref = match_imgs_lbls[0]
-    # Determine number of classes
-    unique_labels = np.unique(lbl_ref)
-    print(f"Unique labels in reference: {unique_labels}")
-    n_classes = len(unique_labels) - 1 if 0 in unique_labels else len(unique_labels)
-    print(f"Found {n_classes} classes: {unique_labels}")
-    
-    # Extract class masks
-    class_masks = extract_class_masks_from_label(lbl_ref, n_classes)
-    print(f"Extracted {len(class_masks)} class masks from reference label")
-    
-    # Preprocess images for SAM2
-    image_ref_sam = preprocess_imgs_for_sam2(img_ref)
+    print(f"LABELS IN QUERY: {np.unique(lbl_query)}")
     image_query_sam = preprocess_imgs_for_sam2(img_query)
+
+    image_refs_sam = []
+    for img_ref, lbl_ref in match_imgs_lbls:
+
+    # img_ref, lbl_ref = match_imgs_lbls[0]
+        # Determine number of classes
+        unique_labels = np.unique(lbl_ref)
+        n_classes = len(unique_labels) - 1 if 0 in unique_labels else len(unique_labels)
+        print(f"Found {n_classes} classes: {unique_labels}")
+        
+        # Preprocess images for SAM2
+        image_ref_sam = preprocess_imgs_for_sam2(img_ref)
+        image_refs_sam.append(image_ref_sam)
     
     # Create array for SAM2
-    all_images = np.stack([image_ref_sam, image_query_sam], axis=0)
-    
+    all_images = np.stack(image_refs_sam + [image_query_sam], axis=0)
+    last_index = all_images.shape[0] - 1
     try:
         # Initialize SAM2
         inference_state = predictor.init_state_by_np_data(all_images)
         
-        # Add masks for each class
-        for i in range(n_classes):
-            if class_masks[i].sum() > 0:  # Only add if class has pixels
-                _, out_obj_ids, out_mask_logits = predictor.add_new_mask(
-                    inference_state=inference_state, 
-                    frame_idx=0, 
-                    obj_id=i+1,  # Object IDs start from 1
-                    mask=class_masks[i]
-                )
-                print(f"Added class {i+1} mask to frame 0")
-            else:
-                print(f"Skipping class {i+1} - no pixels in training mask")
-        
+        for i, (_, lbl_ref) in enumerate(match_imgs_lbls):
+            # Add reference frame masks
+            class_masks_ref = extract_class_masks_from_label(lbl_ref, n_classes)
+            for j in range(1, n_classes+1):
+                mask_index = j - 1
+
+                if mask_index < len(class_masks_ref) and class_masks_ref[mask_index].sum() > 0:
+                    _, out_obj_ids, out_mask_logits = predictor.add_new_mask(
+                        inference_state=inference_state, 
+                        frame_idx=i, 
+                        obj_id=j,  # Object IDs start from 1
+                        mask=class_masks_ref[mask_index]
+                    )
+                    print(f"Added reference class {j} mask to frame {i}")
+                    
         # Propagate to test frame
         out_frame_idx, out_obj_ids, out_mask_logits = next(
-            predictor.propagate_in_video(inference_state, start_frame_idx=1)
+            predictor.propagate_in_video(inference_state, start_frame_idx=last_index)
         )
         
         print(f"Propagated to frame {out_frame_idx}, found {len(out_obj_ids)} objects")
@@ -560,7 +570,8 @@ def get_dino_embeddings(images, processor, model):
 
 
 def create_faiss_index(index, processor, model):
-    db_paths = create_dataset_paths("../dataset/ACDC_2d_slices/Training")
+    db_paths = create_dataset_paths("../dataset/ACDC_2d_slices/Training", patient_nums=["003", "010", "027", "032", "034"])
+    # db_paths = create_dataset_paths("../dataset/ACDC_2d_slices/Training")
     imgs_db, lbls_db = load_medical_imgs(db_paths)
     imgs_embds = get_dino_embeddings(imgs_db, processor, model)
     
@@ -572,14 +583,15 @@ def create_faiss_index(index, processor, model):
 
 
 def get_query_imgs():
-    query_paths = create_validation_paths("../dataset/ACDC_2d_slices/Validation")
+    query_paths = create_validation_paths("../dataset/ACDC_2d_slices/Validation", patient_nums=["019"])
+    # query_paths = create_validation_paths("../dataset/ACDC_2d_slices/Validation")
     imgs_query, lbls_query = load_medical_imgs(query_paths)
     print(f"Loaded {len(lbls_query)} query images")
     imgs_embds = get_dino_embeddings(imgs_query, processor, model)
     return imgs_query, imgs_embds, lbls_query
 
 
-def select_k_closest(index, id_map, img_embedding, k=5):
+def select_k_closest(index, id_map, img_embedding, k=1):
     _, indices = index.search(img_embedding, k)
     results = []
     for pos, i in enumerate(indices[0]):
@@ -590,7 +602,6 @@ def select_k_closest(index, id_map, img_embedding, k=5):
 
 if __name__ == "__main__":
 
-    print("heree")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     processor, model = load_dino_model()
@@ -603,16 +614,14 @@ if __name__ == "__main__":
     # Faiss index and vector store
     index = faiss.IndexFlatIP(768)
     index, id_map = create_faiss_index(index, processor, model)
-    print(f"111")
     # Query embeddings
     query_imgs, query_embds, lbls_query = get_query_imgs()
-    print(f"1111")
     # Perform retrieval
-    match_imgs_lbls = select_k_closest(index, id_map, query_embds[0], k=1)
-    print(len(match_imgs_lbls))
+    match_imgs_lbls = select_k_closest(index, id_map, query_embds[0], k=5)
 
     # exit(0)  # Exit early for testing
-    pred_label, overlayed_image, class_predictions, metrics, img_query_sam = main_multiclass(predictor, query_imgs[0], lbls_query[0], match_imgs_lbls)
+    query_index = 0
+    pred_label, overlayed_image, class_predictions, metrics, img_query_sam = main_multiclass(predictor, query_imgs[query_index], lbls_query[query_index], match_imgs_lbls)
     
     if pred_label is not None:
         print("\n=== Segmentation Results ===")

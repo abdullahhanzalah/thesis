@@ -2,12 +2,14 @@ import os
 import random
 
 
-def create_dataset_paths(dataset_path, total_slices=50):
+def create_dataset_paths(dataset_path, total_slices=50, patient_nums=None):
     es_count, ed_count = 0, 0
     train_paths = []
 
     new_random_numbers = [random.randint(1, 100) for _ in range(10)]
-    patient_nums = [f"{num:03}" for num in new_random_numbers]
+    if not patient_nums:
+        patient_nums = [f"{num:03}" for num in new_random_numbers]
+
     print(f"NUMS: {patient_nums}")
 
     for patient_num in patient_nums:
@@ -37,11 +39,13 @@ def create_dataset_paths(dataset_path, total_slices=50):
     return train_paths
 
 
-def create_validation_paths(dataset_path, total_slices=50):
+def create_validation_paths(dataset_path, total_slices=50, patient_nums=None):
     files = os.listdir(dataset_path)
-    patient_nums = [file.split("_")[0][-3:]for file in files]
-    patient_nums = list(set(patient_nums))  # Unique patient numbers
-    random.shuffle(patient_nums)  # Shuffle the patient numbers
+    if not patient_nums:
+        patient_nums = [file.split("_")[0][-3:]for file in files]
+        patient_nums = list(set(patient_nums))  # Unique patient numbers
+        random.shuffle(patient_nums)  # Shuffle the patient numbers
+
     validation_paths = []
     es_count, ed_count = 0, 0
     for patient_num in patient_nums:

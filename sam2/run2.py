@@ -12,7 +12,6 @@ import os
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-# Color scheme for medical segmentation (common classes)
 MEDICAL_COLORS = [
     [0, 0, 0],  # Background (black)
     [255, 0, 0],  # Class 1: e.g., Left Ventricle (red)
@@ -43,7 +42,6 @@ def load_dino_model():
 def preprocess_imgs_for_sam2(images):
 
     def process(image):
-        """Preprocess image specifically for SAM2 - returns numpy array"""
         # Handle different input shapes
         if len(image.shape) == 3 and image.shape[0] == 1:
             image = image.squeeze(0)  # Remove batch dimension
@@ -86,88 +84,8 @@ def extract_class_masks_from_label(label, n_classes):
     return class_masks
 
 
-# def create_multiclass_overlay(image, class_predictions, class_colors=None, alpha=0.6):
-#     """
-#     Create overlay with different colors for each class
-
-#     Args:
-#         image: original image (H, W) or (H, W, 3)
-#         class_predictions: list of boolean masks for each class (including background)
-#         class_colors: list of RGB colors for each class
-#         alpha: transparency of overlay
-
-#     Returns:
-#         overlayed_image: image with colored class overlays
-#         legend_info: list of (class_name, color) for legend
-#     """
-#     # Default colors for classes
-#     if class_colors is None:
-#         class_colors = [
-#             [0, 0, 0],        # Background (black/transparent)
-#             [255, 0, 0],      # Class 1 (red)
-#             [0, 255, 0],      # Class 2 (green)
-#             [0, 0, 255],      # Class 3 (blue)
-#             [255, 255, 0],    # Class 4 (yellow)
-#             [255, 0, 255],    # Class 5 (magenta)
-#             [0, 255, 255],    # Class 6 (cyan)
-#             [255, 128, 0],    # Class 7 (orange)
-#             [128, 0, 255],    # Class 8 (purple)
-#         ]
-
-#     labels = ["Background", "LV", "Myocardium", "RV"]
-#     # Ensure image is in RGB format
-#     if len(image.shape) == 2:
-#         image = np.stack([image] * 3, axis=-1)
-
-#     # Normalize image to [0, 255] if needed
-#     if image.max() <= 1.0:
-#         image = (image * 255).astype(np.uint8)
-#     else:
-#         image = image.astype(np.uint8)
-
-#     overlayed = image.copy().astype(np.float32)
-#     legend_info = []
-
-#     # Apply each class overlay (skip background class 0)
-#     for i, class_mask in enumerate(class_predictions):
-#         print(f"Processing class {i} with mask shape: {class_mask.shape}")
-#         if i == 0:  # Skip background
-#             continue
-
-#         if class_mask.sum() > 0:  # Only overlay if class has pixels
-#             color = class_colors[i % len(class_colors)]
-#             class_overlay = np.zeros_like(overlayed)
-
-#             # Create colored overlay for this class
-#             mask_3d = class_mask[..., np.newaxis]
-#             class_overlay[class_mask] = color
-
-#             # Blend with existing overlay
-#             overlayed = np.where(mask_3d,
-#                                (1 - alpha) * overlayed + alpha * class_overlay,
-#                                overlayed)
-
-#             legend_info.append((f"{labels[i]}", color))
-
-#     return overlayed.astype(np.uint8), legend_info
-
-
 def create_multiclass_overlay(image, class_predictions, class_colors=None, alpha=0.6):
-    """
-    Create overlay with different colors for each class.
 
-    Args:
-        image: original image (H, W) or (H, W, 3)
-        class_predictions:
-            - list of boolean masks (model output), OR
-            - label map (H, W) with integer IDs
-        class_colors: list of RGB colors for each class
-        alpha: transparency of overlay
-
-    Returns:
-        overlayed_image: image with colored class overlays
-        legend_info: list of (class_name, color) for legend
-    """
     if class_colors is None:
         class_colors = [
             [0, 0, 0],  # Background
@@ -234,11 +152,12 @@ def create_multiclass_overlay(image, class_predictions, class_colors=None, alpha
 
 
 def visualize_multiclass_results(
-    image_test_sam,
+    image_query_sam,
     class_predictions,
     lbl_refs,
     image_refs_sam,
     lbl_query,
+    no_of_ref_imgs,
     class_colors=None,
     save_prefix="multiclass_sam2",
 ):
@@ -257,30 +176,55 @@ def visualize_multiclass_results(
     class_preds_array = np.stack(class_predictions, axis=0)
     pred_label = np.argmax(class_preds_array, axis=0)
 
-    # Create multiclass overlay
-    overlayed_image, legend_info = create_multiclass_overlay(
-        image_test_sam, class_predictions, MEDICAL_COLORS
-    )
-
     ref_image_overlays = []
     for img_ref, lbl_ref in zip(image_refs_sam, lbl_refs):
-        overlayed_image_ref, _ = create_multiclass_overlay(
+        overlayed_image_ref, legend_info = create_multiclass_overlay(
             img_ref, lbl_ref, MEDICAL_COLORS
         )
         ref_image_overlays.append(overlayed_image_ref)
 
-    # Create visualization
-    if lbl_refs is not None:
-        fig, axes = plt.subplots(2, 6, figsize=(15, 10))
+    legend_elements = []
+    for class_name, color in legend_info:
+        legend_elements.append(
+            plt.Rectangle(
+                (0, 0), 1, 1, facecolor=np.array(color) / 255.0, label=class_name
+            )
+        )
 
-        # Top row: Original, Ground Truth, Prediction
-        axes[0, 0].imshow(image_test_sam, cmap="gray")
+    if lbl_refs is not None:
+
+        # REFERENCE IMAGES
+        fig, axes = plt.subplots(1, no_of_ref_imgs, figsize=(15, 10))
+        for i, ref_overlay in enumerate(ref_image_overlays):
+            axes[i].imshow(ref_overlay)
+            axes[i].set_title(f"Ref Image {i+1}")
+            axes[i].axis("off")
+
+        fig.legend(
+            handles=legend_elements, loc="upper right", bbox_to_anchor=(0.98, 0.98)
+        )
+
+        plt.tight_layout()
+        plt.savefig(f"{save_prefix}_visualization.png", dpi=300, bbox_inches="tight")
+        plt.show()
+
+        # PREDICTIONS
+        overlayed_query_image, legend_info = create_multiclass_overlay(
+            image_query_sam, class_predictions, MEDICAL_COLORS
+        )
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+
+        axes[0, 0].imshow(image_query_sam, cmap="gray")
         axes[0, 0].set_title("Test Image")
         axes[0, 0].axis("off")
 
-        axes[0, 1].imshow(pred_label, cmap="tab10", vmin=0, vmax=n_classes)
-        axes[0, 1].set_title("SAM2 Prediction")
+        axes[0, 1].imshow(overlayed_query_image)
+        axes[0, 1].set_title(f"Overlayed Prediciton")
         axes[0, 1].axis("off")
+
+        axes[0, 2].imshow(pred_label, cmap="tab10", vmin=0, vmax=n_classes)
+        axes[0, 2].set_title("SAM2 Prediction")
+        axes[0, 2].axis("off")
 
         axes[0, 2].imshow(
             lbl_query, cmap="tab10", vmin=0, vmax=len(np.unique(lbl_query)) - 1
@@ -289,34 +233,35 @@ def visualize_multiclass_results(
         axes[0, 2].axis("off")
 
         if n_classes >= 1:
-            axes[0, 3].imshow(class_predictions[1], cmap="gray")
-            axes[0, 3].set_title("Class 1 Prediction")
-            axes[0, 3].axis("off")
+            axes[1, 0].imshow(class_predictions[1], cmap="gray")
+            axes[1, 0].set_title("LV")
+            axes[1, 0].axis("off")
 
-            axes[0, 4].axis("off")
-            axes[0, 5].axis("off")
+            axes[1, 1].axis("off")
+            axes[1, 1].axis("off")
 
         if n_classes >= 2:
-            axes[0, 4].imshow(class_predictions[2], cmap="gray")
-            axes[0, 4].set_title("Class 2 Prediction")
-            axes[0, 4].axis("off")
-            axes[0, 5].axis("off")
+            axes[1, 1].imshow(class_predictions[2], cmap="gray")
+            axes[1, 1].set_title("MC")
+            axes[1, 1].axis("off")
+            axes[1, 2].axis("off")
 
         if n_classes >= 3:
-            axes[0, 5].imshow(class_predictions[3], cmap="gray")
-            axes[0, 5].set_title("Class 3 Prediction")
-            axes[0, 5].axis("off")
+            axes[1, 2].imshow(class_predictions[3], cmap="gray")
+            axes[1, 2].set_title("RV")
 
-        for i, ref_overlay in enumerate(ref_image_overlays):
-            axes[1, i].imshow(ref_overlay)
-            axes[1, i].set_title(f"Ref Image {i+1}")
-            axes[1, i].axis("off")
+        fig.legend(
+            handles=legend_elements, loc="upper right", bbox_to_anchor=(0.98, 0.98)
+        )
 
-        axes[1, 5].axis("off")  # Empty space if not enough reference images
+        plt.tight_layout()
+        plt.savefig(f"{save_prefix}_visualization.png", dpi=300, bbox_inches="tight")
+        plt.show()
+
     else:
         fig, axes = plt.subplots(1, 3, figsize=(12, 4))
 
-        axes[0].imshow(image_test_sam, cmap="gray")
+        axes[0].imshow(image_query_sam, cmap="gray")
         axes[0].set_title("Test Image")
         axes[0].axis("off")
 
@@ -328,30 +273,15 @@ def visualize_multiclass_results(
         axes[2].set_title("Multi-class Overlay")
         axes[2].axis("off")
 
-    # Add legend
-    legend_elements = []
-    for class_name, color in legend_info:
-        legend_elements.append(
-            plt.Rectangle(
-                (0, 0), 1, 1, facecolor=np.array(color) / 255.0, label=class_name
-            )
-        )
-
-    if legend_elements:
-        fig.legend(
-            handles=legend_elements, loc="upper right", bbox_to_anchor=(0.98, 0.98)
-        )
-
-    plt.tight_layout()
-    plt.savefig(f"{save_prefix}_visualization.png", dpi=300, bbox_inches="tight")
-    plt.show()
-
-    # Save individual results
     save_multiclass_results(
-        image_test_sam, pred_label, overlayed_image, class_predictions, save_prefix
+        image_query_sam,
+        pred_label,
+        overlayed_query_image,
+        class_predictions,
+        save_prefix,
     )
 
-    return pred_label, overlayed_image
+    return pred_label, overlayed_query_image
 
 
 def save_multiclass_results(image, pred_label, overlay, class_predictions, prefix):
@@ -366,7 +296,9 @@ def save_multiclass_results(image, pred_label, overlay, class_predictions, prefi
 
     for i, class_mask in enumerate(class_predictions):
         if i == 0:  # Background
-            plt.imsave(f"{folder}/{prefix}_class_background.png", class_mask, cmap="gray")
+            plt.imsave(
+                f"{folder}/{prefix}_class_background.png", class_mask, cmap="gray"
+            )
         else:
             plt.imsave(f"{folder}/{prefix}_class_{i}.png", class_mask, cmap="gray")
 
@@ -374,7 +306,6 @@ def save_multiclass_results(image, pred_label, overlay, class_predictions, prefi
 
 
 def calculate_class_metrics(pred_label, true_label, n_classes):
-    """Calculate metrics for each class"""
     metrics = {}
 
     for class_id in range(n_classes + 1):  # Include background
@@ -401,7 +332,7 @@ def calculate_class_metrics(pred_label, true_label, n_classes):
     return metrics
 
 
-def main_multiclass(predictor, img_query, lbl_query, match_imgs_lbls):
+def main_multiclass(predictor, img_query, lbl_query, match_imgs_lbls, no_of_ref_imgs):
 
     print(f"LABELS IN QUERY: {np.unique(lbl_query)}")
     image_query_sam = preprocess_imgs_for_sam2(img_query)
@@ -418,11 +349,10 @@ def main_multiclass(predictor, img_query, lbl_query, match_imgs_lbls):
         image_refs_sam.append(image_ref_sam)
         lbl_refs.append(lbl_ref)
 
-    # Create array for SAM2
     all_images = np.stack(image_refs_sam + [image_query_sam], axis=0)
     last_index = all_images.shape[0] - 1
     try:
-        # Initialize SAM2
+
         inference_state = predictor.init_state_by_np_data(all_images)
 
         for i, (_, lbl_ref) in enumerate(match_imgs_lbls):
@@ -482,7 +412,12 @@ def main_multiclass(predictor, img_query, lbl_query, match_imgs_lbls):
 
             # Visualize results
             overlayed_image = visualize_multiclass_results(
-                image_query_sam, class_preds, lbl_refs, image_refs_sam, lbl_query
+                image_query_sam,
+                class_preds,
+                lbl_refs,
+                image_refs_sam,
+                lbl_query,
+                no_of_ref_imgs,
             )
 
             # Calculate metrics if ground truth available
@@ -568,6 +503,7 @@ def get_query_imgs():
     # query_paths = create_validation_paths("../dataset/ACDC_2d_slices/Validation")
     imgs_query, lbls_query = load_medical_imgs(query_paths)
     print(f"Loaded {len(lbls_query)} query images")
+    print(f"LIST OF IMGS IN QUERY: {query_paths}")
     imgs_embds = get_dino_embeddings(imgs_query, processor, model)
     return imgs_query, imgs_embds, lbls_query
 
@@ -584,6 +520,9 @@ def select_k_closest(index, id_map, img_embedding, k=1):
 
 if __name__ == "__main__":
 
+    K = 8
+    QUERY_INDEX = 0
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     processor, model = load_dino_model()
@@ -596,44 +535,14 @@ if __name__ == "__main__":
     index = faiss.IndexFlatIP(768)
     index, id_map = create_faiss_index(index, processor, model)
     query_imgs, query_embds, lbls_query = get_query_imgs()
-    match_imgs_lbls = select_k_closest(index, id_map, query_embds[0], k=5)
+    match_imgs_lbls = select_k_closest(index, id_map, query_embds[0], k=K)
 
-    query_index = 1
     pred_label, overlayed_image, class_predictions, metrics, img_query_sam = (
         main_multiclass(
-            predictor, query_imgs[query_index], lbls_query[query_index], match_imgs_lbls
+            predictor,
+            query_imgs[QUERY_INDEX],
+            lbls_query[QUERY_INDEX],
+            match_imgs_lbls,
+            K,
         )
     )
-
-    if pred_label is not None:
-        print("\n=== Segmentation Results ===")
-        print(f"Prediction shape: {pred_label.shape}")
-        print(f"Classes found: {np.unique(pred_label)}")
-
-        # You can also create custom overlays with specific colors
-        custom_overlay, legend = create_multiclass_overlay(
-            img_query_sam, class_predictions, MEDICAL_COLORS, alpha=0.5
-        )
-
-        # Display custom overlay
-        plt.figure(figsize=(10, 5))
-        plt.subplot(1, 2, 1)
-        plt.imshow(img_query_sam, cmap="gray")
-        plt.title("Original Test Image")
-        plt.axis("off")
-
-        plt.subplot(1, 2, 2)
-        plt.imshow(custom_overlay)
-        plt.title("Multi-class Prediction Overlay")
-        plt.axis("off")
-
-        # Add legend
-        legend_elements = [
-            plt.Rectangle((0, 0), 1, 1, facecolor=np.array(color) / 255.0, label=name)
-            for name, color in legend
-        ]
-        plt.legend(handles=legend_elements, bbox_to_anchor=(1.05, 1), loc="upper left")
-
-        plt.tight_layout()
-        plt.savefig("multiclass_overlay_custom.png", dpi=300, bbox_inches="tight")
-        plt.show()

@@ -8,6 +8,7 @@ from sam2.build_sam import build_sam2_video_predictor
 import h5py
 from dataset_sam2 import create_dataset_paths, create_validation_paths
 import os
+import medpy.metric.binary as metrics
 
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -309,25 +310,20 @@ def calculate_class_metrics(pred_label, true_label, n_classes):
     metrics = {}
 
     for class_id in range(n_classes + 1):  # Include background
-        true_mask = true_label == class_id
-        pred_mask = pred_label == class_id
+        true_mask = (true_label == class_id).astype(int)
+        pred_mask = (pred_label == class_id).astype(int)
 
         # Calculate IoU
         intersection = np.logical_and(true_mask, pred_mask).sum()
         union = np.logical_or(true_mask, pred_mask).sum()
         iou = intersection / union if union > 0 else 0
 
-        # Calculate Dice coefficient
-        dice = (
-            2 * intersection / (true_mask.sum() + pred_mask.sum())
-            if (true_mask.sum() + pred_mask.sum()) > 0
-            else 0
-        )
+        dice = Dice(pred_mask, true_mask)
 
         class_name = "Background" if class_id == 0 else f"Class {class_id}"
         metrics[class_name] = {"IoU": iou, "Dice": dice}
-
-        print(f"{class_name}: IoU={iou:.3f}, Dice={dice:.3f}")
+        best = np.max(dice, axis=0)
+        print(f"{class_name}: Dice={dice:.3f}, Best={best:.3f}")
 
     return metrics
 
@@ -381,7 +377,6 @@ def main_multiclass(predictor, img_query, lbl_query, match_imgs_lbls, no_of_ref_
         print(f"Propagated to frame {out_frame_idx}, found {len(out_obj_ids)} objects")
 
         if out_mask_logits is not None:
-            # Process predictions following the reference code pattern
             if isinstance(out_mask_logits, torch.Tensor):
                 mask_logits = out_mask_logits.detach().cpu().numpy()
             else:
@@ -395,22 +390,15 @@ def main_multiclass(predictor, img_query, lbl_query, match_imgs_lbls, no_of_ref_
                     class_pred = class_pred.squeeze()
                 class_preds.append(class_pred)
 
-            # Compute background prediction
             if len(class_preds) > 0:
                 background_pred = np.logical_not(np.logical_or.reduce(class_preds))
             else:
                 background_pred = np.ones_like(image_query_sam, dtype=bool)
 
-            class_preds.insert(0, background_pred)  # Add background as class 0
-
-            # Create final prediction label
+            class_preds.insert(0, background_pred)
             class_preds_array = np.stack(class_preds, axis=0)
             pred_label = np.argmax(class_preds_array, axis=0)
 
-            print(f"Final prediction shape: {pred_label.shape}")
-            print(f"Predicted classes: {np.unique(pred_label)}")
-
-            # Visualize results
             overlayed_image = visualize_multiclass_results(
                 image_query_sam,
                 class_preds,
@@ -420,9 +408,8 @@ def main_multiclass(predictor, img_query, lbl_query, match_imgs_lbls, no_of_ref_
                 no_of_ref_imgs,
             )
 
-            # Calculate metrics if ground truth available
-            if lbl_ref is not None:
-                metrics = calculate_class_metrics(pred_label, lbl_ref, n_classes)
+            if lbl_query is not None:
+                metrics = calculate_class_metrics(pred_label, lbl_query, n_classes)
 
             return pred_label, overlayed_image, class_preds, metrics, image_query_sam
 
@@ -518,10 +505,37 @@ def select_k_closest(index, id_map, img_embedding, k=1):
     return results
 
 
+def evaluate(pred_label, true_label, n_classes, eval_metrics=["Dice"]):
+    """Evaluate the predicted labels against the ground truth."""
+    scores = {}
+    for eval_metric in eval_metrics:
+        if n_classes == 1:
+            scores[eval_metric] = eval_metric(pred_label, true_label)
+        else:
+            scores[eval_metric] = multiclass_score(
+                pred_label, true_label, eval_metric, n_classes
+            )
+    return scores
+
+
+def multiclass_score(result, reference, metric, num_classes):
+    scores = []
+
+    for i in range(1, num_classes + 1):
+        result_i, reference_i = (result == i).astype(int), (reference == i).astype(int)
+        scores.append(metric(result_i, reference_i))
+
+    return scores
+
+
+def Dice(result, reference):
+    return metrics.dc(result, reference)
+
+
 if __name__ == "__main__":
 
     K = 8
-    QUERY_INDEX = 0
+    QUERY_INDEX = 8
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")

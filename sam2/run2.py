@@ -1,14 +1,15 @@
-import matplotlib.pyplot as plt
-from PIL import Image
+import os
+import h5py
+import faiss
 import torch
 import numpy as np
-from transformers import AutoImageProcessor, AutoModel
-import faiss
-from sam2.build_sam import build_sam2_video_predictor
-import h5py
-from dataset_sam2 import create_dataset_paths, create_validation_paths
-import os
+import matplotlib.pyplot as plt
 import medpy.metric.binary as metrics
+
+from PIL import Image
+from sam2.build_sam import build_sam2_video_predictor
+from transformers import AutoImageProcessor, AutoModel
+from dataset_sam2 import create_dataset_paths, create_validation_paths
 
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -409,9 +410,15 @@ def main_multiclass(predictor, img_query, lbl_query, match_imgs_lbls, no_of_ref_
             )
 
             if lbl_query is not None:
-                metrics = calculate_class_metrics(pred_label, lbl_query, n_classes)
+                pred_metrics = calculate_class_metrics(pred_label, lbl_query, n_classes)
 
-            return pred_label, overlayed_image, class_preds, metrics, image_query_sam
+            return (
+                pred_label,
+                overlayed_image,
+                class_preds,
+                pred_metrics,
+                image_query_sam,
+            )
 
     except Exception as e:
         print(f"Error during multiclass SAM2 processing: {e}")
@@ -534,7 +541,7 @@ def Dice(result, reference):
 
 if __name__ == "__main__":
 
-    K = 8
+    K = 2
     QUERY_INDEX = 8
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -549,14 +556,16 @@ if __name__ == "__main__":
     index = faiss.IndexFlatIP(768)
     index, id_map = create_faiss_index(index, processor, model)
     query_imgs, query_embds, lbls_query = get_query_imgs()
-    match_imgs_lbls = select_k_closest(index, id_map, query_embds[0], k=K)
 
-    pred_label, overlayed_image, class_predictions, metrics, img_query_sam = (
-        main_multiclass(
-            predictor,
-            query_imgs[QUERY_INDEX],
-            lbls_query[QUERY_INDEX],
-            match_imgs_lbls,
-            K,
+    for i, query_embd in enumerate(query_embds):
+        print(f"Processing query image {i + 1}/{len(query_embds)}")
+        match_imgs_lbls = select_k_closest(index, id_map, query_embd, k=K)
+        pred_label, overlayed_image, class_predictions, pred_metrics, img_query_sam = (
+            main_multiclass(
+                predictor,
+                query_imgs[i],
+                lbls_query[i],
+                match_imgs_lbls,
+                K,
+            )
         )
-    )

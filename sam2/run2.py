@@ -1,15 +1,14 @@
-import os
-import h5py
-import faiss
+import matplotlib.pyplot as plt
+from PIL import Image
 import torch
 import numpy as np
-import matplotlib.pyplot as plt
-import medpy.metric.binary as metrics
-
-from PIL import Image
-from sam2.build_sam import build_sam2_video_predictor
 from transformers import AutoImageProcessor, AutoModel
+import faiss
+from sam2.build_sam import build_sam2_video_predictor
+import h5py
 from dataset_sam2 import create_dataset_paths, create_validation_paths
+import os
+import medpy.metric.binary as metrics
 
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
